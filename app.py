@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from journal import Journal
+
 PORT = 8204
 ROLES = {"viewer", "requester", "operator", "commander", "auditor"}
 
@@ -46,6 +48,23 @@ class Repository:
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
         CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedule_journal(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_key TEXT NOT NULL UNIQUE,
+            schedule_id INTEGER REFERENCES schedules(id),
+            request_id INTEGER REFERENCES requests(id),
+            seq INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            from_status TEXT,
+            to_status TEXT,
+            payload_json TEXT NOT NULL,
+            needs_review INTEGER NOT NULL DEFAULT 0,
+            backfill INTEGER NOT NULL DEFAULT 0,
+            actor TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_schedule_journal_schedule ON schedule_journal(schedule_id, seq);
         """)
 
     @contextmanager
@@ -61,7 +80,17 @@ class Repository:
 
 
 class SatelliteSchedulingService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.journal = Journal()
+
+    def recover(self) -> dict[str, Any]:
+        """升级回填 + 崩溃恢复：先补旧数据流水，再按流水逐条重放状态。"""
+        with self.repo.tx() as conn:
+            self.journal.ensure_schema(conn)
+            backfill_report = self.journal.backfill(conn)
+            reconcile_report = self.journal.reconcile(conn)
+        return {"backfill": backfill_report, "reconcile": reconcile_report}
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -147,6 +176,7 @@ class SatelliteSchedulingService:
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
     def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> int:
+        # 中断（interrupted）排程未消费，不计入占用，时段还给租户配额
         sql = """SELECT COALESCE(SUM((julianday(s.ends_at)-julianday(s.starts_at))*86400),0) FROM schedules s JOIN requests r ON r.id=s.request_id
                  WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')"""
         args: list[Any] = [tenant, station, day]
@@ -192,6 +222,11 @@ class SatelliteSchedulingService:
             schedule_id = cur.lastrowid
             conn.execute("UPDATE requests SET status='scheduled' WHERE id=?", (request_id,))
             Repository.audit(conn, request_id, schedule_id, actor, role, "schedule_created", {"window_id": window_id, "antenna_id": antenna_id, "capacity_mb": transferred})
+            op_key = str(body.get("op_key", "")).strip() or f"auto:schedule_created:request:{request_id}:window:{window_id}:{iso(start)}"
+            self.journal.append(conn, op_key=op_key, schedule_id=schedule_id, request_id=request_id,
+                                event="schedule_created", from_status=None, to_status="scheduled",
+                                payload={"window_id": window_id, "antenna_id": antenna_id, "capacity_mb": transferred},
+                                actor=actor, role=role)
             return self.get_schedule(schedule_id)
 
     def get_schedule(self, schedule_id: int) -> dict[str, Any]:
@@ -199,27 +234,54 @@ class SatelliteSchedulingService:
         if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
         return dict(row)
 
+    def get_schedule_journal(self, schedule_id: int) -> list[dict[str, Any]]:
+        if not self.repo.conn.execute("SELECT 1 FROM schedules WHERE id=?", (schedule_id,)).fetchone():
+            raise ApiError(404, "schedule_not_found", "排程不存在")
+        return [dict(r) for r in self.repo.conn.execute(
+            "SELECT id,op_key,seq,event,from_status,to_status,payload_json,needs_review,backfill,actor,role,created_at FROM schedule_journal WHERE schedule_id=? ORDER BY seq",
+            (schedule_id,)).fetchall()]
+
     def transition(self, schedule_id: int, actor: str, role: str, tenant: str, target: str, body: dict[str, Any]) -> dict[str, Any]:
+        event = "start" if target == "receiving" else "complete"
+        op_key = str(body.get("op_key", "")).strip() or f"auto:{event}:{schedule_id}"
         with self.repo.tx() as conn:
+            existing = self.journal.op_exists(conn, op_key)
+            if existing:
+                if existing["schedule_id"] != schedule_id: raise ApiError(409, "op_key_conflict", "操作单号已被其他排程使用")
+                return self.get_schedule(schedule_id)  # 同一张操作单只认一次，重复请求原样返回
             row = conn.execute("""SELECT s.*,r.tenant,r.status request_status FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
-            if target == "receiving":
+            if event == "start":
                 if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能开始接收")
                 if row["status"] != "scheduled": raise ApiError(409, "invalid_transition", "只有已排程任务可以开始接收")
+                # 先记流水，再改状态
+                self.journal.append(conn, op_key=op_key, schedule_id=schedule_id, request_id=row["request_id"],
+                                    event="start", from_status="scheduled", to_status="receiving",
+                                    payload={"rate_mbps": row["rate_mbps"], "station_id": row["station_id"]}, actor=actor, role=role)
                 conn.execute("UPDATE schedules SET status='receiving',revision=revision+1,updated_at=? WHERE id=?", (iso(), schedule_id))
-            elif target == "received":
+            else:
                 if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能完成接收")
                 if row["status"] != "receiving": raise ApiError(409, "invalid_transition", "只有接收中任务可以完成")
+                # 先记流水，再改状态；流水唯一，重复完成不会把用量记两遍
+                self.journal.append(conn, op_key=op_key, schedule_id=schedule_id, request_id=row["request_id"],
+                                    event="complete", from_status="receiving", to_status="received",
+                                    payload={"rate_mbps": row["rate_mbps"], "station_id": row["station_id"],
+                                             "duration_seconds": int((parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds())},
+                                    actor=actor, role=role)
                 conn.execute("UPDATE schedules SET status='received',revision=revision+1,updated_at=? WHERE id=?", (iso(), schedule_id))
                 conn.execute("UPDATE requests SET status='received' WHERE id=?", (row["request_id"],))
-            else: raise ApiError(400, "invalid_transition", "未知状态")
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, f"receive_{target}", {})
             return self.get_schedule(schedule_id)
 
     def cancel_schedule(self, schedule_id: int, actor: str, role: str, tenant: str, body: dict[str, Any]) -> dict[str, Any]:
         reason = str(body.get("reason", "")).strip()
         if not reason: raise ApiError(400, "reason_required", "取消原因必填")
+        op_key = str(body.get("op_key", "")).strip() or f"auto:cancel:{schedule_id}"
         with self.repo.tx() as conn:
+            existing = self.journal.op_exists(conn, op_key)
+            if existing:
+                if existing["schedule_id"] != schedule_id: raise ApiError(409, "op_key_conflict", "操作单号已被其他排程使用")
+                return self.get_schedule(schedule_id)
             row = conn.execute("""SELECT s.*,r.tenant FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
             if role == "requester":
@@ -228,6 +290,9 @@ class SatelliteSchedulingService:
             elif role not in {"operator", "commander"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消排程")
             if row["status"] == "received": raise ApiError(409, "received_data_protected", "已接收数据不能取消或删除")
             if row["status"] == "canceled": return self.get_schedule(schedule_id)
+            self.journal.append(conn, op_key=op_key, schedule_id=schedule_id, request_id=row["request_id"],
+                                event="cancel", from_status=row["status"], to_status="canceled",
+                                payload={"reason": reason}, actor=actor, role=role)
             conn.execute("UPDATE schedules SET status='canceled',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), schedule_id))
             conn.execute("UPDATE requests SET status='pending' WHERE id=?", (row["request_id"],))
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, "schedule_canceled", {"reason": reason})
@@ -237,11 +302,20 @@ class SatelliteSchedulingService:
         if role != "commander": raise ApiError(403, "commander_required", "只有任务指挥官可以执行紧急抢占")
         order_id, reason = str(body.get("order_id", "")).strip(), str(body.get("reason", "")).strip()
         if not order_id or not reason: raise ApiError(400, "emergency_details_required", "order_id 和 reason 必填")
+        op_key = str(body.get("op_key", "")).strip() or f"auto:preempt:{schedule_id}"
         with self.repo.tx() as conn:
+            existing = self.journal.op_exists(conn, op_key)
+            if existing:
+                if existing["schedule_id"] != schedule_id: raise ApiError(409, "op_key_conflict", "操作单号已被其他排程使用")
+                return {"schedule": self.get_schedule(schedule_id), "reschedule_required": True, "order_id": order_id}
             row = conn.execute("""SELECT s.*,r.priority,r.tenant FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
             if row["status"] == "received": raise ApiError(409, "received_data_protected", "已接收数据的排程不能被抢占")
             if row["status"] not in {"scheduled", "receiving"}: raise ApiError(409, "invalid_transition", "当前排程不可抢占")
+            self.journal.append(conn, op_key=op_key, schedule_id=schedule_id, request_id=row["request_id"],
+                                event="preempt", from_status=row["status"], to_status="preempted",
+                                payload={"order_id": order_id, "reason": reason, "displaced_priority": row["priority"]},
+                                actor=actor, role=role)
             conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (f"{order_id}: {reason}", iso(), schedule_id))
             conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, "emergency_preemption", {"order_id": order_id, "reason": reason, "displaced_priority": row["priority"]})
@@ -251,23 +325,59 @@ class SatelliteSchedulingService:
         if role not in {"operator", "commander"}: raise ApiError(403, "window_forbidden", "当前角色不能变更可见窗口")
         start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
         if end <= start: raise ApiError(400, "invalid_window", "窗口结束时间必须晚于开始时间")
+        op_key = str(body.get("op_key", "")).strip() or f"auto:window_change:{window_id}"
         with self.repo.tx() as conn:
+            if self.journal.op_exists(conn, op_key):
+                # 同一张窗口变更单只认一次：原样返回当前窗口与影响明细
+                window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
+                if not window: raise ApiError(404, "window_not_found", "可见窗口不存在")
+                impacts = [json.loads(ev["payload_json"]).get("impact", {}) for ev in
+                           conn.execute("SELECT payload_json FROM schedule_journal WHERE op_key LIKE ? ORDER BY seq", (f"{op_key}:%",)).fetchall()]
+                return {"window": dict(window), "impacts": impacts, "idempotent": True}
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             if not window: raise ApiError(404, "window_not_found", "可见窗口不存在")
+            # 父流水：本张窗口变更单只认一次
+            self.journal.append(conn, op_key=op_key, schedule_id=None, request_id=None,
+                                event="window_change", from_status=None, to_status=None,
+                                payload={"window_id": window_id, "starts_at": iso(start), "ends_at": iso(end)},
+                                actor=actor, role=role)
             rows = conn.execute("SELECT * FROM schedules WHERE window_id=? AND status IN ('scheduled','receiving','received')", (window_id,)).fetchall()
             impacts = []
             for row in rows:
                 sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
                 invalid = sched_start < start or sched_end > end
                 if row["status"] == "received":
-                    impacts.append({"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid})
+                    impact = {"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid}
+                    # 窗口变化写进同一条流水；已接收数据继续保留，状态不动
+                    self.journal.append(conn, op_key=f"{op_key}:sched:{row['id']}", schedule_id=row["id"],
+                                        request_id=row["request_id"], event="window_change",
+                                        from_status="received", to_status="received",
+                                        payload={"window_id": window_id, "action": "preserve_received_data", "impact": impact,
+                                                 "new_starts_at": iso(start), "new_ends_at": iso(end)},
+                                        actor=actor, role=role)
+                    impacts.append(impact)
                     continue
                 if invalid:
+                    impact = {"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted",
+                              "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]}
+                    self.journal.append(conn, op_key=f"{op_key}:sched:{row['id']}", schedule_id=row["id"],
+                                        request_id=row["request_id"], event="window_change",
+                                        from_status=row["status"], to_status="preempted",
+                                        payload={"window_id": window_id, "action": "preempted", "impact": impact,
+                                                 "new_starts_at": iso(start), "new_ends_at": iso(end)},
+                                        actor=actor, role=role)
                     conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
                     conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
-                    impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
+                    impacts.append(impact)
                 else:
-                    impacts.append({"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"})
+                    impact = {"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"}
+                    self.journal.append(conn, op_key=f"{op_key}:sched:{row['id']}", schedule_id=row["id"],
+                                        request_id=row["request_id"], event="window_change",
+                                        from_status=row["status"], to_status=row["status"],
+                                        payload={"window_id": window_id, "action": "unchanged", "impact": impact,
+                                                 "new_starts_at": iso(start), "new_ends_at": iso(end)},
+                                        actor=actor, role=role)
+                    impacts.append(impact)
             conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,revision=revision+1 WHERE id=?", (iso(start), iso(end), window_id))
             Repository.audit(conn, None, None, actor, role, "visibility_window_changed", {"window_id": window_id, "impacts": impacts})
             return {"window": dict(conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()), "impacts": impacts}
@@ -316,6 +426,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, tenant)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "schedules"] and parts[2].isdigit() and parts[3] == "journal":
+            return 200, self.service.get_schedule_journal(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, tenant = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
@@ -356,7 +468,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def create_server(db_path: str | Path, host: str = "127.0.0.1", port: int = PORT) -> ThreadingHTTPServer:
-    service = SatelliteSchedulingService(db_path); handler = type("SatelliteHandler", (Handler,), {"service": service, "web_root": Path(__file__).resolve().parent / "static"}); return ThreadingHTTPServer((host, port), handler)
+    service = SatelliteSchedulingService(db_path)
+    report = service.recover()  # 启动时按流水恢复：回填旧数据、重放状态、中断无完成记录的接收
+    if report["backfill"]["events_backfilled"] or report["reconcile"]["interrupted"] or report["reconcile"]["fixed"] or report["reconcile"]["needs_review"]:
+        print(f"recovery report: {json.dumps(report, ensure_ascii=False)}")
+    handler = type("SatelliteHandler", (Handler,), {"service": service, "web_root": Path(__file__).resolve().parent / "static"}); return ThreadingHTTPServer((host, port), handler)
 
 
 def main() -> None:

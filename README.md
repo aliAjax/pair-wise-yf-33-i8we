@@ -19,7 +19,24 @@ python3 app.py --db satellite_scheduling.db
 - `POST /api/requests/{id}/schedule`、`/reschedule`：排程或重排被抢占请求。
 - `POST /api/schedules/{id}/start`、`/complete`、`/cancel`、`/preempt`：接收状态和紧急抢占。
 - `POST /api/visibility-windows/{id}/change`：窗口变化并返回受影响排程；已接收数据保留。
+- `GET /api/schedules/{id}/journal`：查询排程的执行流水。
 - `GET /api/state`、`GET /api/schedules/{id}`：权限化状态查询。
+
+## 执行流水与崩溃恢复
+
+接收过程通过 `schedule_journal` 表记录追加式流水，流水判定、状态改动、接口入口三层分离（`journal.py` / `app.py` / `Handler`）。
+
+- **先记流水再改状态**：排程开始、完成、取消、抢占、窗口变化都在同一事务内先落流水、再改状态。
+- **操作单幂等**：每个操作可带 `op_key`（操作单号）；同一 `op_key` 只认一次，重复提交原样返回，重复完成不会把用量记两遍。未带 `op_key` 时按排程与事件派生唯一键。
+- **崩溃恢复**：服务启动时自动 `recover()`——按流水逐条重放状态；接收中但查不到完成记录的排程转成 `interrupted`，未消费的时段不计入租户占用（配额自动归还），请求回到 `pending` 可重新排程。
+- **窗口变化**：写进同一条流水（父流水 + 每条受影响排程一条）；已接收数据保留，状态不回滚。
+- **旧数据兼容**：升级时对没有流水的排程按现有状态回填起始流水，全部标记 `needs_review`；状态推断不出的只补起始条并记入待核对。
+
+恢复报告会在启动时打印，例如：
+
+```
+recovery report: {"backfill": {...}, "reconcile": {"interrupted": [{"schedule_id": 1, "request_id": 1}], ...}}
+```
 
 ## 测试
 
