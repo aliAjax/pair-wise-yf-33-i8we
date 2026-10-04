@@ -16,6 +16,14 @@ from urllib.parse import urlparse
 PORT = 8204
 ROLES = {"viewer", "requester", "operator", "commander", "auditor"}
 
+# 排程终态与流水事件：流水判定只读这两张映射，状态改动与接口入口各自独立。
+SCHEDULE_STATES = {"scheduled", "receiving", "received", "canceled", "preempted", "interrupted"}
+JOURNAL_EVENTS = {"scheduled", "started", "completed", "canceled", "preempted", "interrupted", "window_changed"}
+# 事件重放后的期望状态；window_changed 不改状态（在判定时跳过）。
+EVENT_STATUS = {"scheduled": "scheduled", "started": "receiving", "completed": "received", "canceled": "canceled", "preempted": "preempted", "interrupted": "interrupted"}
+# 各状态占用的租户配额：interrupted 只计流水里实际消费的 billed_seconds。
+QUOTA_STATES = ("scheduled", "receiving", "received", "interrupted")
+
 
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str, details: Any = None):
@@ -44,9 +52,20 @@ class Repository:
         CREATE TABLE IF NOT EXISTS visibility_windows(id INTEGER PRIMARY KEY AUTOINCREMENT, satellite_id TEXT NOT NULL REFERENCES satellites(id), station_id TEXT NOT NULL REFERENCES stations(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, max_rate_mbps REAL NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY AUTOINCREMENT, satellite_id TEXT NOT NULL REFERENCES satellites(id), tenant TEXT NOT NULL, priority INTEGER NOT NULL, data_mb REAL NOT NULL, deadline TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
-        CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, billed_seconds INTEGER NOT NULL DEFAULT 0, reconcile_status TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedule_journal(id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER NOT NULL REFERENCES schedules(id), request_id INTEGER NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL, from_status TEXT, to_status TEXT, operation_id TEXT, actor TEXT NOT NULL, role TEXT NOT NULL, billed_seconds INTEGER, backfilled INTEGER NOT NULL DEFAULT 0, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_operation ON schedule_journal(operation_id) WHERE operation_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_journal_schedule ON schedule_journal(schedule_id, seq);
         """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        # 旧库没有流水与计费列：补列后由服务层 recover() 回填起始流水。
+        for ddl in ("ALTER TABLE schedules ADD COLUMN billed_seconds INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE schedules ADD COLUMN reconcile_status TEXT"):
+            try: self.conn.execute(ddl)
+            except sqlite3.OperationalError: pass
 
     @contextmanager
     def tx(self):
@@ -61,7 +80,119 @@ class Repository:
 
 
 class SatelliteSchedulingService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path, recover_on_start: bool = True):
+        self.repo = Repository(path); self.recovery_report: dict[str, Any] | None = None
+        if recover_on_start: self.recover()
+
+    # ---------- 流水判定层：只从流水推导事实，不直接改状态 ----------
+    @staticmethod
+    def _next_seq(conn: sqlite3.Connection, schedule_id: int) -> int:
+        row = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM schedule_journal WHERE schedule_id=?", (schedule_id,)).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _ensure_fresh_operation(conn: sqlite3.Connection, operation_id: str | None) -> None:
+        # 操作单预检：同一张单第二次提交直接拒绝；schedule_journal 的唯一索引兜底并发。
+        if operation_id and conn.execute("SELECT 1 FROM schedule_journal WHERE operation_id=?", (operation_id,)).fetchone():
+            raise ApiError(409, "operation_already_recorded", "同一张操作单只认一次，请勿重复提交", {"operation_id": operation_id})
+
+    @staticmethod
+    def _expected_status(events: list[sqlite3.Row]) -> tuple[str | None, bool]:
+        """按 seq 重放流水，返回(期望终态, 是否有过开始接收)。window_changed 不参与状态判定。"""
+        expected, started = None, False
+        for ev in events:
+            if ev["event"] == "started": started = True
+            if ev["event"] == "window_changed": continue
+            expected = EVENT_STATUS[ev["event"]]
+        return expected, started
+
+    @staticmethod
+    def _elapsed_seconds(row: sqlite3.Row, at: datetime) -> int:
+        start, end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
+        return max(0, min(int((end - start).total_seconds()), int((at - start).total_seconds())))
+
+    def _journal(self, conn: sqlite3.Connection, row: sqlite3.Row, event: str, actor: str, role: str, *,
+                 to_status: str | None = None, operation_id: str | None = None, billed_seconds: int | None = None,
+                 backfilled: bool = False, detail: dict[str, Any] | None = None) -> int:
+        """先写流水：所有生命周期事件的唯一落库入口，operation_id 重复时拒绝（同一张操作单只认一次）。"""
+        seq = self._next_seq(conn, row["id"])
+        try:
+            cur = conn.execute("""INSERT INTO schedule_journal(schedule_id,request_id,seq,event,from_status,to_status,operation_id,actor,role,billed_seconds,backfilled,detail_json,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               (row["id"], row["request_id"], seq, event, row["status"], to_status, operation_id, actor, role, billed_seconds, 1 if backfilled else 0, json.dumps(detail or {}, ensure_ascii=False, sort_keys=True), iso()))
+        except sqlite3.IntegrityError as exc:
+            raise ApiError(409, "operation_already_recorded", "同一张操作单只认一次，请勿重复提交", {"operation_id": operation_id}) from exc
+        return int(cur.lastrowid)
+
+    def _backfill_legacy(self, conn: sqlite3.Connection, row: sqlite3.Row) -> list[sqlite3.Row]:
+        """升级兼容：旧排程没有流水，按现有状态回填一条起始流水链；补不齐的留待 recover 标记待核对。"""
+        duration = int((parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds())
+        legacy_billed = {"scheduled": duration, "receiving": duration, "received": duration, "canceled": 0, "preempted": 0}
+        chain: list[tuple[str, str | None, int | None, bool, dict[str, Any]]]
+        pending = False
+        if row["status"] == "scheduled":
+            chain = [("scheduled", "scheduled", duration, False, {"legacy": "按现有状态回填起始流水"})]
+        elif row["status"] == "receiving":
+            # 有开始无完成记录，补不齐实际用量，先记全额，恢复时转中断并挂待核对。
+            chain = [("scheduled", "scheduled", duration, False, {"legacy": "按现有状态回填起始流水"}),
+                     ("started", "receiving", duration, False, {"legacy": "接收中无流水，实际用量待核对"})]
+            pending = True
+        elif row["status"] == "received":
+            chain = [("scheduled", "scheduled", duration, False, {"legacy": "按现有状态回填起始流水"}),
+                     ("started", "receiving", duration, False, {"legacy": "补回填"}),
+                     ("completed", "received", duration, False, {"legacy": "完成时间补不齐，按计划时长回填用量"})]
+        elif row["status"] == "canceled":
+            chain = [("scheduled", "scheduled", 0, False, {"legacy": "按现有状态回填起始流水"}),
+                     ("canceled", "canceled", 0, False, {"legacy": "取消时间与原因补不齐", "reason": row["disposition_reason"]})]
+        else:
+            # preempted：抢占前是 scheduled 还是 receiving 无法判定，补不齐，记待核对。
+            chain = [("scheduled", "scheduled", duration, False, {"legacy": "按现有状态回填起始流水"}),
+                     ("preempted", "preempted", 0, True, {"legacy": "抢占前状态补不齐，记待核对", "reason": row["disposition_reason"]})]
+            pending = True
+        billed_total = legacy_billed.get(row["status"], duration)
+        for event, to_status, billed, _mark, detail in chain:
+            self._journal(conn, row, event, "system-migration", "system", to_status=to_status, billed_seconds=billed, backfilled=True, detail=detail)
+        conn.execute("UPDATE schedules SET billed_seconds=?, reconcile_status=? WHERE id=?",
+                     (billed_total, "pending" if pending else None, row["id"]))
+        return conn.execute("SELECT * FROM schedule_journal WHERE schedule_id=? ORDER BY seq", (row["id"],)).fetchall()
+
+    def _interrupt_crashed(self, conn: sqlite3.Connection, row: sqlite3.Row, events: list[sqlite3.Row], legacy: bool) -> None:
+        """接收中查不到完成记录：转 interrupted，未消费时段退还租户配额。"""
+        duration = int((parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds())
+        charged = self._elapsed_seconds(row, utcnow())
+        note = "升级旧数据：接收中缺完成记录，实际用量补不齐，按已过时段估算待核对" if legacy else "服务恢复：接收中无完成记录，按崩溃处理"
+        self._journal(conn, row, "interrupted", "system-recovery", "system", to_status="interrupted", billed_seconds=charged,
+                      backfilled=legacy, detail={"reason": "crash_recovery_no_completion", "planned_seconds": duration, "charged_seconds": charged, "released_seconds": max(0, duration - charged), "note": note})
+        conn.execute("""UPDATE schedules SET status='interrupted',billed_seconds=?,reconcile_status=COALESCE(reconcile_status,?),
+                        disposition_reason=COALESCE(disposition_reason,'crash_recovery_no_completion'),revision=revision+1,updated_at=? WHERE id=?""",
+                     (charged, "pending" if legacy else None, iso(), row["id"]))
+        conn.execute("UPDATE requests SET status='pending' WHERE id=?", (row["request_id"],))
+        Repository.audit(conn, row["request_id"], row["id"], "system-recovery", "system", "crash_interrupted",
+                         {"planned_seconds": duration, "charged_seconds": charged, "released_seconds": max(0, duration - charged), "reconcile_pending": legacy})
+
+    def recover(self) -> dict[str, Any]:
+        """服务启动恢复：逐条重放流水，旧数据先回填；状态与流水不一致时以流水为准修复。"""
+        report: dict[str, Any] = {"backfilled": [], "interrupted": [], "repaired": []}
+        with self.repo.tx() as conn:
+            schedules = conn.execute("SELECT * FROM schedules ORDER BY id").fetchall()
+            for srow in schedules:
+                events = conn.execute("SELECT * FROM schedule_journal WHERE schedule_id=? ORDER BY seq", (srow["id"],)).fetchall()
+                legacy = False
+                if not events:
+                    events = self._backfill_legacy(conn, srow); legacy = True; report["backfilled"].append(srow["id"])
+                expected, started = self._expected_status(events)
+                if srow["status"] == "receiving" and expected == "receiving":
+                    # 有 started 流水但没有完成/取消/抢占/中断等终态记录 —— 上次服务在接收中崩溃。
+                    self._interrupt_crashed(conn, srow, events, legacy); report["interrupted"].append(srow["id"]); continue
+                if expected and srow["status"] != expected:
+                    duration = int((parse_time(srow["ends_at"]) - parse_time(srow["starts_at"])).total_seconds())
+                    billed = duration if expected in ("scheduled", "receiving") else srow["billed_seconds"] if expected == "interrupted" else 0
+                    conn.execute("UPDATE schedules SET status=?,billed_seconds=?,revision=revision+1,updated_at=? WHERE id=?", (expected, billed, iso(), srow["id"]))
+                    req_status = "received" if expected == "received" else "scheduled" if expected in ("scheduled", "receiving") else "preempted" if expected == "preempted" else "pending"
+                    conn.execute("UPDATE requests SET status=? WHERE id=?", (req_status, srow["request_id"]))
+                    report["repaired"].append({"schedule_id": srow["id"], "from_status": srow["status"], "to_status": expected})
+        self.recovery_report = report; return report
+    # ---------- 流水判定层结束 ----------
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -147,9 +278,10 @@ class SatelliteSchedulingService:
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
     def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> int:
-        sql = """SELECT COALESCE(SUM((julianday(s.ends_at)-julianday(s.starts_at))*86400),0) FROM schedules s JOIN requests r ON r.id=s.request_id
-                 WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')"""
-        args: list[Any] = [tenant, station, day]
+        states = ",".join("?" for _ in QUOTA_STATES)
+        sql = f"""SELECT COALESCE(SUM(s.billed_seconds),0) FROM schedules s JOIN requests r ON r.id=s.request_id
+                 WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ({states})"""
+        args: list[Any] = [tenant, station, day, *QUOTA_STATES]
         if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
         return int(conn.execute(sql, args).fetchone()[0])
 
@@ -158,7 +290,9 @@ class SatelliteSchedulingService:
         window_id, antenna_id = body.get("window_id"), str(body.get("antenna_id", "")).strip()
         start, end, rate = parse_time(body.get("starts_at")), parse_time(body.get("ends_at")), body.get("rate_mbps")
         if not isinstance(window_id, int) or not antenna_id or end <= start or not isinstance(rate, (int, float)) or float(rate) <= 0: raise ApiError(400, "invalid_schedule", "排程参数无效")
+        operation_id = str(body.get("operation_id", "")).strip() or None
         with self.repo.tx() as conn:
+            self._ensure_fresh_operation(conn, operation_id)
             request = conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
             window = conn.execute("SELECT * FROM visibility_windows WHERE id=?", (window_id,)).fetchone()
             antenna = conn.execute("SELECT * FROM antennas WHERE id=?", (antenna_id,)).fetchone()
@@ -186,10 +320,13 @@ class SatelliteSchedulingService:
             used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
             duration = int((end - start).total_seconds())
             if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
-            cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                               (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
+            cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,billed_seconds,created_by,created_at,updated_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), duration, actor, iso(), iso()))
             schedule_id = cur.lastrowid
+            srow = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+            self._journal(conn, srow, "scheduled", actor, role, to_status="scheduled", operation_id=operation_id, billed_seconds=duration,
+                          detail={"window_id": window_id, "antenna_id": antenna_id, "capacity_mb": transferred})
             conn.execute("UPDATE requests SET status='scheduled' WHERE id=?", (request_id,))
             Repository.audit(conn, request_id, schedule_id, actor, role, "schedule_created", {"window_id": window_id, "antenna_id": antenna_id, "capacity_mb": transferred})
             return self.get_schedule(schedule_id)
@@ -200,25 +337,33 @@ class SatelliteSchedulingService:
         return dict(row)
 
     def transition(self, schedule_id: int, actor: str, role: str, tenant: str, target: str, body: dict[str, Any]) -> dict[str, Any]:
+        if target not in {"receiving", "received"}: raise ApiError(400, "invalid_transition", "未知状态")
+        operation_id = str(body.get("operation_id", "")).strip() or None
         with self.repo.tx() as conn:
             row = conn.execute("""SELECT s.*,r.tenant,r.status request_status FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
+            if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能执行该接收操作")
+            self._ensure_fresh_operation(conn, operation_id)
+            duration = int((parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds())
             if target == "receiving":
-                if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能开始接收")
                 if row["status"] != "scheduled": raise ApiError(409, "invalid_transition", "只有已排程任务可以开始接收")
+                self._journal(conn, row, "started", actor, role, to_status="receiving", operation_id=operation_id, billed_seconds=duration, detail={})
                 conn.execute("UPDATE schedules SET status='receiving',revision=revision+1,updated_at=? WHERE id=?", (iso(), schedule_id))
-            elif target == "received":
-                if role not in {"operator", "commander"}: raise ApiError(403, "receive_forbidden", "当前角色不能完成接收")
+                Repository.audit(conn, row["request_id"], schedule_id, actor, role, "receive_receiving", {})
+            else:
+                if row["status"] == "received": raise ApiError(409, "already_completed", "排程已完成，重复完成不会把用量记两遍")
                 if row["status"] != "receiving": raise ApiError(409, "invalid_transition", "只有接收中任务可以完成")
-                conn.execute("UPDATE schedules SET status='received',revision=revision+1,updated_at=? WHERE id=?", (iso(), schedule_id))
+                # 完成流水先落库：按计划时段结算用量，之后再改状态。
+                self._journal(conn, row, "completed", actor, role, to_status="received", operation_id=operation_id, billed_seconds=duration, detail={"billed_seconds": duration})
+                conn.execute("UPDATE schedules SET status='received',billed_seconds=?,revision=revision+1,updated_at=? WHERE id=?", (duration, iso(), schedule_id))
                 conn.execute("UPDATE requests SET status='received' WHERE id=?", (row["request_id"],))
-            else: raise ApiError(400, "invalid_transition", "未知状态")
-            Repository.audit(conn, row["request_id"], schedule_id, actor, role, f"receive_{target}", {})
+                Repository.audit(conn, row["request_id"], schedule_id, actor, role, "receive_received", {"billed_seconds": duration})
             return self.get_schedule(schedule_id)
 
     def cancel_schedule(self, schedule_id: int, actor: str, role: str, tenant: str, body: dict[str, Any]) -> dict[str, Any]:
         reason = str(body.get("reason", "")).strip()
         if not reason: raise ApiError(400, "reason_required", "取消原因必填")
+        operation_id = str(body.get("operation_id", "")).strip() or None
         with self.repo.tx() as conn:
             row = conn.execute("""SELECT s.*,r.tenant FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
@@ -226,9 +371,12 @@ class SatelliteSchedulingService:
                 if row["tenant"] != tenant: raise ApiError(403, "tenant_forbidden", "不能取消其他租户排程")
                 if row["status"] != "scheduled": raise ApiError(409, "cancel_not_allowed", "接收开始后租户不能取消")
             elif role not in {"operator", "commander"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消排程")
+            self._ensure_fresh_operation(conn, operation_id)
             if row["status"] == "received": raise ApiError(409, "received_data_protected", "已接收数据不能取消或删除")
             if row["status"] == "canceled": return self.get_schedule(schedule_id)
-            conn.execute("UPDATE schedules SET status='canceled',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), schedule_id))
+            # 取消先记流水（未消费时段全部退还配额），再改排程与请求状态。
+            self._journal(conn, row, "canceled", actor, role, to_status="canceled", operation_id=operation_id, billed_seconds=0, detail={"reason": reason})
+            conn.execute("UPDATE schedules SET status='canceled',billed_seconds=0,disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), schedule_id))
             conn.execute("UPDATE requests SET status='pending' WHERE id=?", (row["request_id"],))
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, "schedule_canceled", {"reason": reason})
             return self.get_schedule(schedule_id)
@@ -240,9 +388,12 @@ class SatelliteSchedulingService:
         with self.repo.tx() as conn:
             row = conn.execute("""SELECT s.*,r.priority,r.tenant FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
             if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
+            self._ensure_fresh_operation(conn, order_id)
             if row["status"] == "received": raise ApiError(409, "received_data_protected", "已接收数据的排程不能被抢占")
             if row["status"] not in {"scheduled", "receiving"}: raise ApiError(409, "invalid_transition", "当前排程不可抢占")
-            conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (f"{order_id}: {reason}", iso(), schedule_id))
+            # 同一张抢占操作单只认一次（operation_id 全局唯一）；抢占后未消费时段全部退还配额。
+            self._journal(conn, row, "preempted", actor, role, to_status="preempted", operation_id=order_id, billed_seconds=0, detail={"order_id": order_id, "reason": reason, "displaced_priority": row["priority"]})
+            conn.execute("UPDATE schedules SET status='preempted',billed_seconds=0,disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", (f"{order_id}: {reason}", iso(), schedule_id))
             conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
             Repository.audit(conn, row["request_id"], schedule_id, actor, role, "emergency_preemption", {"order_id": order_id, "reason": reason, "displaced_priority": row["priority"]})
             return {"schedule": self.get_schedule(schedule_id), "reschedule_required": True, "order_id": order_id}
@@ -259,14 +410,22 @@ class SatelliteSchedulingService:
             for row in rows:
                 sched_start, sched_end = parse_time(row["starts_at"]), parse_time(row["ends_at"])
                 invalid = sched_start < start or sched_end > end
+                detail = {"window_id": window_id, "old_window": {"starts_at": window["starts_at"], "ends_at": window["ends_at"], "revision": window["revision"]},
+                          "new_window": {"starts_at": iso(start), "ends_at": iso(end)}, "invalid": invalid}
                 if row["status"] == "received":
+                    # 已接收数据继续保留：窗口变化只追加同一条流水，不改状态、不动用量。
+                    self._journal(conn, row, "window_changed", actor, role, to_status="received", billed_seconds=row["billed_seconds"], detail={**detail, "preserved": True})
                     impacts.append({"schedule_id": row["id"], "action": "preserve_received_data", "reason": "已接收数据不可回滚", "invalid": invalid})
                     continue
                 if invalid:
-                    conn.execute("UPDATE schedules SET status='preempted',disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
+                    # 窗口变化先记流水（window_changed 与抢占各一条），未消费时段退还配额，再改状态。
+                    self._journal(conn, row, "window_changed", actor, role, to_status=row["status"], billed_seconds=row["billed_seconds"], detail=detail)
+                    self._journal(conn, row, "preempted", actor, role, to_status="preempted", billed_seconds=0, detail={"reason": "visibility_window_changed", **detail})
+                    conn.execute("UPDATE schedules SET status='preempted',billed_seconds=0,disposition_reason=?,revision=revision+1,updated_at=? WHERE id=?", ("visibility_window_changed", iso(), row["id"]))
                     conn.execute("UPDATE requests SET status='preempted' WHERE id=?", (row["request_id"],))
                     impacts.append({"schedule_id": row["id"], "request_id": row["request_id"], "action": "preempted", "reason": "新窗口无法覆盖原排程", "old_start": row["starts_at"], "old_end": row["ends_at"]})
                 else:
+                    self._journal(conn, row, "window_changed", actor, role, to_status=row["status"], billed_seconds=row["billed_seconds"], detail=detail)
                     impacts.append({"schedule_id": row["id"], "action": "unchanged", "reason": "新窗口仍覆盖排程"})
             conn.execute("UPDATE visibility_windows SET starts_at=?,ends_at=?,revision=revision+1 WHERE id=?", (iso(start), iso(end), window_id))
             Repository.audit(conn, None, None, actor, role, "visibility_window_changed", {"window_id": window_id, "impacts": impacts})
@@ -295,6 +454,15 @@ class SatelliteSchedulingService:
             stations = [dict(r) for r in conn.execute("SELECT * FROM stations ORDER BY id")]
         return {"requests": requests, "schedules": schedules, "stations": stations, "server_time": iso()}
 
+    def get_journal(self, schedule_id: int, role: str, tenant: str) -> dict[str, Any]:
+        conn = self.repo.conn
+        row = conn.execute("""SELECT s.id,s.status,r.tenant FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
+        if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
+        if role == "requester" and row["tenant"] != tenant: raise ApiError(403, "tenant_forbidden", "不能查看其他租户排程流水")
+        events = [dict(e) | {"detail": json.loads(e["detail_json"])} for e in conn.execute("SELECT * FROM schedule_journal WHERE schedule_id=? ORDER BY seq", (schedule_id,))]
+        for ev in events: ev.pop("detail_json", None)
+        return {"schedule_id": schedule_id, "status": row["status"], "events": events}
+
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
     raw = json.dumps(payload, ensure_ascii=False, default=str).encode(); handler.send_response(status); handler.send_header("Content-Type", "application/json; charset=utf-8"); handler.send_header("Content-Length", str(len(raw))); handler.end_headers(); handler.wfile.write(raw)
@@ -316,6 +484,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, tenant)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "schedules"] and parts[2].isdigit() and parts[3] == "journal": return 200, self.service.get_journal(int(parts[2]), role, tenant)
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, tenant = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
